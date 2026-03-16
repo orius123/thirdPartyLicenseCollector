@@ -1,4 +1,4 @@
-module github.com/aviadl/thirdPartyLicenseCollector
+module github.com/orius123/thirdPartyLicenseCollector
 
 go 1.21
 
