@@ -40,10 +40,12 @@ func Collect(projectGO, projectNPM string, projectNodeModules string, fileName s
 	var err error
 	if len(projectGO) > 0 {
 		switch goMode {
+		case GoModeVendor:
+			err = collectGoLicenseFiles(projectGO, licenseMap, foundManualLicense)
 		case GoModeList:
 			err = collectGoLicenseFilesFromList(projectGO, licenseMap, foundManualLicense)
 		default:
-			err = collectGoLicenseFiles(projectGO, licenseMap, foundManualLicense)
+			return fmt.Errorf("invalid -go-mode %q: must be %q or %q", goMode, GoModeVendor, GoModeList)
 		}
 	}
 	if len(projectNPM) > 0 {
@@ -142,8 +144,13 @@ func collectGoLicenseFilesFromList(tmpGoDir string, licenseMap map[string][]stri
 		if err := decoder.Decode(&mod); err != nil {
 			return fmt.Errorf("failed to parse go list output: %w", err)
 		}
-		// Skip the main module(s) and modules without a cached directory.
-		if mod.Main || mod.Dir == "" {
+		// Skip the main module(s).
+		if mod.Main {
+			continue
+		}
+		// Module not in cache — log so missing licenses are visible.
+		if mod.Dir == "" {
+			log.Printf("skipping %s: not in module cache (run 'go mod download')\n", mod.Path)
 			continue
 		}
 		modules = append(modules, mod)
@@ -161,43 +168,11 @@ func collectGoLicenseFilesFromList(tmpGoDir string, licenseMap map[string][]stri
 	}
 
 	for _, mod := range modules {
-		// In list mode, the module directory in the cache IS the root for
-		// that module — equivalent to vendor/<module>. We pass mod.Dir as
-		// both the base dir and let doParseFile resolve the license from
-		// the module root directly.
-		lDir, licenseDescriptor, missing := parseLicenseManual(mod.Path, manualLicense)
-		if missing {
-			l, lErr := license.NewFromDir(mod.Dir)
-			if lErr != nil {
-				log.Println("Could not find license for ", mod.Path)
-				licenseMissing = true
-				continue
-			}
-			if l.Type != "" {
-				arr := licenseMap[l.Type]
-				if !InStringSlice(arr, mod.Path) {
-					arr = append(arr, mod.Path)
-					licenseMap[l.Type] = arr
-				}
-			}
-		} else if len(licenseDescriptor) > 0 {
-			if licenseDescriptor == "ignore" {
-				continue
-			}
-			if strings.Index(licenseDescriptor, " ") == -1 {
-				arr, exists := licenseMap[licenseDescriptor]
-				if exists {
-					if !InStringSlice(arr, lDir) {
-						arr = append(arr, lDir)
-						licenseMap[licenseDescriptor] = arr
-					}
-				} else {
-					foundManualLicense[lDir] = licenseDescriptor
-				}
-			} else {
-				foundManualLicense[lDir] = licenseDescriptor
-			}
-		}
+		// Reuse the shared processModule helper which handles manual
+		// license lookup, auto-detection, and result recording — same
+		// logic as doParseFile but accepting an explicit module name
+		// and root directory instead of deriving them from a vendor tree.
+		processModule(mod.Path, mod.Dir, manualLicense, licenseMap, foundManualLicense)
 	}
 	return nil
 }
@@ -237,25 +212,27 @@ func collectNpmLicenseFiles(tmpNpmDir string, tmpNodeModulesDir string, licenseM
 	return nil
 }
 
-func doParseFile(dir, fileDir string, manualLicense map[string]string, licenseMap map[string][]string, foundManualLicense map[string]string) {
-	lDir, licenseDescriptor, missing := parseLicenseManual(fileDir, manualLicense)
+// processModule handles manual license lookup, auto-detection, and result
+// recording for a single module. Both vendor and list modes call this.
+//   - moduleName: the Go import path (e.g. "github.com/foo/bar")
+//   - moduleDir:  the on-disk directory containing the module source
+func processModule(moduleName, moduleDir string, manualLicense map[string]string, licenseMap map[string][]string, foundManualLicense map[string]string) {
+	lDir, licenseDescriptor, missing := parseLicenseManual(moduleName, manualLicense)
 	if missing {
-		lDir, lType, missing := parseLicenseAuto(dir, fileDir)
-		lDir = lDir[len(dir)+1:]
-		if missing {
-			log.Println("Could not find license for ", lDir)
+		l, err := license.NewFromDir(moduleDir)
+		if err != nil {
+			log.Println("Could not find license for ", moduleName)
 			licenseMissing = true
+			return
 		}
-		if lType != "" {
-			arr := licenseMap[lType]
-			if !InStringSlice(arr, lDir) {
-				arr = append(arr, lDir)
-				licenseMap[lType] = arr
+		if l.Type != "" {
+			arr := licenseMap[l.Type]
+			if !InStringSlice(arr, moduleName) {
+				arr = append(arr, moduleName)
+				licenseMap[l.Type] = arr
 			}
 		}
 	} else if len(licenseDescriptor) > 0 {
-		//License can be either a single word, then we will check in the licenseMap
-		//If it is more than one word, we will simply place it there ...
 		if licenseDescriptor == "ignore" {
 			return
 		}
@@ -272,6 +249,23 @@ func doParseFile(dir, fileDir string, manualLicense map[string]string, licenseMa
 		} else {
 			foundManualLicense[lDir] = licenseDescriptor
 		}
+	}
+}
+
+// doParseFile resolves a module from a vendor-style directory tree and
+// delegates to processModule. Kept for vendor mode where the module root
+// must be found by walking parent directories.
+func doParseFile(dir, fileDir string, manualLicense map[string]string, licenseMap map[string][]string, foundManualLicense map[string]string) {
+	// First check manual license by package path.
+	_, _, manualMissing := parseLicenseManual(fileDir, manualLicense)
+	if manualMissing {
+		// Auto-detect: walk parent dirs to find the license root.
+		lDir, _, _ := parseLicenseAuto(dir, fileDir)
+		moduleName := lDir[len(dir)+1:]
+		processModule(moduleName, lDir, manualLicense, licenseMap, foundManualLicense)
+	} else {
+		// Manual license found — delegate with the vendor dir as module root.
+		processModule(fileDir, filepath.Join(dir, fileDir), manualLicense, licenseMap, foundManualLicense)
 	}
 }
 
