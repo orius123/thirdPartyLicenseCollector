@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -19,18 +19,32 @@ const LicenseFileName = "THIRD_PARTY_LICENSE"
 const DefaultLicenseFileFormat = "txt"
 const vendorGoModuleFile = "modules.txt"
 
+// GoMode controls how Go dependencies are resolved.
+// "vendor" reads vendor/modules.txt (original behavior).
+// "list" uses "go list -m -json all" and reads from the module cache.
+const (
+	GoModeVendor = "vendor"
+	GoModeList   = "list"
+)
+
 // licenseMissing indicates that a license is missing
 var licenseMissing = false
 
-// Collect collects licenses from npm and or go projects
-func Collect(projectGO, projectNPM string, projectNodeModules string, fileName string, fileFormat string) error {
+// Collect collects licenses from npm and or go projects.
+// goMode controls Go dependency resolution: "vendor" or "list".
+func Collect(projectGO, projectNPM string, projectNodeModules string, fileName string, fileFormat string, goMode string) error {
 	licenseMap := map[string][]string{}
 	foundManualLicense := map[string]string{}
 
 	licenseMissing = false
 	var err error
 	if len(projectGO) > 0 {
-		err = collectGoLicenseFiles(projectGO, licenseMap, foundManualLicense)
+		switch goMode {
+		case GoModeList:
+			err = collectGoLicenseFilesFromList(projectGO, licenseMap, foundManualLicense)
+		default:
+			err = collectGoLicenseFiles(projectGO, licenseMap, foundManualLicense)
+		}
 	}
 	if len(projectNPM) > 0 {
 		err = collectNpmLicenseFiles(projectNPM, projectNodeModules, licenseMap, foundManualLicense)
@@ -48,7 +62,7 @@ func Collect(projectGO, projectNPM string, projectNodeModules string, fileName s
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(fileName, fileData, 0644)
+	err = os.WriteFile(fileName, fileData, 0644)
 	if err != nil {
 		return err
 	}
@@ -97,6 +111,97 @@ func collectGoLicenseFiles(tmpGoDir string, licenseMap map[string][]string, foun
 	return nil
 }
 
+// goListModule represents the JSON output of "go list -m -json".
+type goListModule struct {
+	Path string `json:"Path"`
+	Dir  string `json:"Dir"`
+	Main bool   `json:"Main"`
+}
+
+// collectGoLicenseFilesFromList uses "go list -m -json all" to enumerate
+// dependencies and reads license files from the module cache directory.
+// This avoids the need for a vendor directory.
+func collectGoLicenseFilesFromList(tmpGoDir string, licenseMap map[string][]string, foundManualLicense map[string]string) error {
+	log.Println("Go Project dir (list mode): ", tmpGoDir)
+
+	cmd := exec.Command("go", "list", "-m", "-json", "all")
+	cmd.Dir = tmpGoDir
+	out, err := cmd.Output()
+	if err != nil {
+		log.Println(err)
+		log.Println("failed running 'go list -m -json all'. make sure Go modules are available (run 'go mod download')")
+		return err
+	}
+
+	// "go list -m -json all" outputs concatenated JSON objects (not an array).
+	// Decode them one by one.
+	decoder := json.NewDecoder(strings.NewReader(string(out)))
+	var modules []goListModule
+	for decoder.More() {
+		var mod goListModule
+		if err := decoder.Decode(&mod); err != nil {
+			return fmt.Errorf("failed to parse go list output: %w", err)
+		}
+		// Skip the main module(s) and modules without a cached directory.
+		if mod.Main || mod.Dir == "" {
+			continue
+		}
+		modules = append(modules, mod)
+	}
+
+	if len(modules) == 0 {
+		return errors.New("no modules found via 'go list -m -json all'")
+	}
+
+	log.Printf("Found %d dependency modules\n", len(modules))
+
+	manualLicense, err := prepareManualLicense(tmpGoDir)
+	if err != nil {
+		return err
+	}
+
+	for _, mod := range modules {
+		// In list mode, the module directory in the cache IS the root for
+		// that module — equivalent to vendor/<module>. We pass mod.Dir as
+		// both the base dir and let doParseFile resolve the license from
+		// the module root directly.
+		lDir, licenseDescriptor, missing := parseLicenseManual(mod.Path, manualLicense)
+		if missing {
+			l, lErr := license.NewFromDir(mod.Dir)
+			if lErr != nil {
+				log.Println("Could not find license for ", mod.Path)
+				licenseMissing = true
+				continue
+			}
+			if l.Type != "" {
+				arr := licenseMap[l.Type]
+				if !InStringSlice(arr, mod.Path) {
+					arr = append(arr, mod.Path)
+					licenseMap[l.Type] = arr
+				}
+			}
+		} else if len(licenseDescriptor) > 0 {
+			if licenseDescriptor == "ignore" {
+				continue
+			}
+			if strings.Index(licenseDescriptor, " ") == -1 {
+				arr, exists := licenseMap[licenseDescriptor]
+				if exists {
+					if !InStringSlice(arr, lDir) {
+						arr = append(arr, lDir)
+						licenseMap[licenseDescriptor] = arr
+					}
+				} else {
+					foundManualLicense[lDir] = licenseDescriptor
+				}
+			} else {
+				foundManualLicense[lDir] = licenseDescriptor
+			}
+		}
+	}
+	return nil
+}
+
 func collectNpmLicenseFiles(tmpNpmDir string, tmpNodeModulesDir string, licenseMap map[string][]string, foundManualLicense map[string]string) error {
 	log.Println("NPM Project dir: ", tmpNpmDir)
 	nodeModulesDir := tmpNpmDir
@@ -106,7 +211,7 @@ func collectNpmLicenseFiles(tmpNpmDir string, tmpNodeModulesDir string, licenseM
 	dir := filepath.Join(nodeModulesDir, "node_modules")
 	fileName := filepath.Join(tmpNpmDir, "package.json")
 	log.Println("Processing package file: ", fileName)
-	data, err := ioutil.ReadFile(fileName)
+	data, err := os.ReadFile(fileName)
 	if err != nil {
 		log.Println(err)
 		log.Println("Failed processing npm licenses")
@@ -253,7 +358,7 @@ func parseLicenseAuto(dir, fileDir string) (lDir string, lType string, missing b
 func prepareManualLicense(vendorDir string) (map[string]string, error) {
 	fileName := filepath.Join(vendorDir, "manualLicense.json")
 	log.Println("Processing manual license file: ", fileName)
-	data, err := ioutil.ReadFile(fileName)
+	data, err := os.ReadFile(fileName)
 	if err != nil {
 		log.Println("No manual license file")
 		return map[string]string{}, nil
