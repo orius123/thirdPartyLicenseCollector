@@ -212,6 +212,40 @@ func collectNpmLicenseFiles(tmpNpmDir string, tmpNodeModulesDir string, licenseM
 	return nil
 }
 
+// licenseFileNames lists common license file names (case-insensitive base names).
+// Used as a fallback when go-license's NewFromDir fails to detect the file.
+var licenseFileNames = []string{
+	"LICENSE", "LICENCE", "LICENSE.md", "LICENCE.md",
+	"LICENSE.txt", "LICENCE.txt", "LICENSE-MIT", "LICENSE-APACHE",
+	"COPYING", "COPYING.md", "COPYING.txt",
+	"MIT-LICENSE", "MIT-LICENSE.txt",
+}
+
+// findLicenseFile searches moduleDir for any common license file name.
+// Returns the file content and true if found, or empty string and false.
+func findLicenseFile(moduleDir string) (string, bool) {
+	entries, err := os.ReadDir(moduleDir)
+	if err != nil {
+		return "", false
+	}
+	nameSet := make(map[string]struct{}, len(licenseFileNames))
+	for _, n := range licenseFileNames {
+		nameSet[strings.ToUpper(n)] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, ok := nameSet[strings.ToUpper(entry.Name())]; ok {
+			data, err := os.ReadFile(filepath.Join(moduleDir, entry.Name()))
+			if err == nil {
+				return string(data), true
+			}
+		}
+	}
+	return "", false
+}
+
 // processModule handles manual license lookup, auto-detection, and result
 // recording for a single module. Both vendor and list modes call this.
 //   - moduleName: the Go import path (e.g. "github.com/foo/bar")
@@ -221,6 +255,12 @@ func processModule(moduleName, moduleDir string, manualLicense map[string]string
 	if missing {
 		l, err := license.NewFromDir(moduleDir)
 		if err != nil {
+			// Fallback: search for common license file names that
+			// go-license doesn't recognize (COPYING, LICENCE, etc.)
+			if content, found := findLicenseFile(moduleDir); found {
+				foundManualLicense[moduleName] = content
+				return
+			}
 			log.Println("Could not find license for ", moduleName)
 			licenseMissing = true
 			return
